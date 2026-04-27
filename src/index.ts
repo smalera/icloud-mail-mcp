@@ -14,7 +14,7 @@ import { iCloudConfig, IcloudMailError } from './types/config.js';
 const server = new Server(
   {
     name: 'icloud-mail-mcp',
-    version: '1.2.0',
+    version: '1.3.0',
   },
   {
     capabilities: {
@@ -217,7 +217,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'move_messages',
         description:
-          'Move messages between mailboxes by IMAP UID. Idempotent: messages whose RFC822 Message-ID already exists in the destination are skipped, not duplicated.',
+          'Move messages between mailboxes by IMAP UID. Idempotent: messages whose RFC822 Message-ID already exists in the destination are skipped, not duplicated. Returns count verification by default — compares source and destination totals before/after to surface drift.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -239,6 +239,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 'If true, return previews of messages that would be moved without performing the move.',
               default: false,
+            },
+            verifyCounts: {
+              type: 'boolean',
+              description:
+                'If true (default), capture source and destination counts before/after the move and surface a countWarning if the deltas disagree with the expected number of moves by more than 5 messages. Disable when chaining many moves to save round-trips.',
+              default: true,
             },
           },
           required: ['messageIds', 'sourceMailbox', 'destinationMailbox'],
@@ -297,7 +303,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'delete_messages',
-        description: 'Delete messages by IMAP UID',
+        description:
+          'Delete messages by IMAP UID. Returns count verification by default — captures the source mailbox total before/after to surface drift.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -316,6 +323,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 'If true, return previews of messages that would be deleted without performing the delete.',
               default: false,
+            },
+            verifyCounts: {
+              type: 'boolean',
+              description:
+                'If true (default), capture mailbox total before/after the delete and surface a countWarning if the delta differs from the expected number of deletes by more than 5 messages.',
+              default: true,
             },
           },
           required: ['messageIds'],
@@ -381,7 +394,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: 'auto_organize',
         description:
-          'Automatically organize emails based on rules (sender, subject keywords). Considers up to maxMessages (default 100) most recent messages from sourceMailbox; for larger sets, use search_messages + move_messages with explicit UIDs. Inherits the idempotent move from move_messages.',
+          'Automatically organize emails based on rules (sender, subject keywords). Considers up to maxMessages (default 100) most recent messages from sourceMailbox; for larger sets, use search_messages + move_messages with explicit UIDs. Inherits the idempotent move from move_messages. Each rule has a ruleStatus of "completed" | "pending" | "failed"; if the time budget is exhausted before all rules run, remaining rules are returned with ruleStatus: "pending" so callers can retry just those.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -436,6 +449,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 'Maximum number of recent messages to consider from sourceMailbox (default: 100). Caps how much of the mailbox the rules scan in one call.',
               default: 100,
+            },
+            timeBudgetMs: {
+              type: 'number',
+              description:
+                'Wall-clock budget in milliseconds for the whole call (default: 50000). When the budget is exhausted, remaining rules are returned with ruleStatus: "pending" instead of being silently dropped at the MCP timeout. Set lower for tighter loops, higher only if you control the MCP-client timeout.',
+              default: 50000,
             },
           },
           required: ['rules'],
@@ -542,11 +561,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const sourceMailbox = args?.sourceMailbox as string;
         const destinationMailbox = args?.destinationMailbox as string;
         const dryRun = (args?.dryRun as boolean) || false;
+        const verifyCounts =
+          args?.verifyCounts === undefined
+            ? undefined
+            : (args.verifyCounts as boolean);
         const result = await client.moveMessages(
           messageIds,
           sourceMailbox,
           destinationMailbox,
-          { dryRun }
+          { dryRun, verifyCounts }
         );
         return jsonContent(result);
       }
@@ -572,8 +595,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const messageIds = (args?.messageIds as string[]) ?? [];
         const mailbox = (args?.mailbox as string) || 'INBOX';
         const dryRun = (args?.dryRun as boolean) || false;
+        const verifyCounts =
+          args?.verifyCounts === undefined
+            ? undefined
+            : (args.verifyCounts as boolean);
         const result = await client.deleteMessages(messageIds, mailbox, {
           dryRun,
+          verifyCounts,
         });
         return jsonContent(result);
       }
@@ -616,11 +644,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const sourceMailbox = (args?.sourceMailbox as string) || 'INBOX';
         const dryRun = (args?.dryRun as boolean) || false;
         const maxMessages = (args?.maxMessages as number) || 100;
+        const timeBudgetMs = (args?.timeBudgetMs as number) || 50000;
         const result = await client.autoOrganize(
           rules,
           sourceMailbox,
           dryRun,
-          maxMessages
+          maxMessages,
+          timeBudgetMs
         );
         return jsonContent(result);
       }

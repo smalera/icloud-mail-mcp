@@ -58,7 +58,9 @@ Add to your MCP server configuration:
 
 ## Available Tools
 
-> **v1.2.0 — breaking change**: `messageId` values are now **IMAP UIDs as strings** (e.g. `"12345"`), not RFC822 `Message-ID` headers. The header value is still returned in the new `rfc822MessageId` field on `EmailMessage`. See [docs/CHANGELOG.md](docs/CHANGELOG.md) for the full list of changes and bug fixes.
+> **v1.3.0 (current)** — auto-recovery from the `"Can not re-use ImapFlow instance"` wedge that previously required manual restart, plus count verification on moves/deletes and partial-progress reporting on `auto_organize`. See [docs/CHANGELOG.md](docs/CHANGELOG.md).
+>
+> **v1.2.0 — breaking change**: `messageId` values are **IMAP UIDs as strings** (e.g. `"12345"`), not RFC822 `Message-ID` headers. The header value is still returned in the new `rfc822MessageId` field on `EmailMessage`.
 
 <details>
 <summary><strong>Click to view all available tools</strong></summary>
@@ -99,7 +101,7 @@ Mark email messages as read by IMAP UID.
 
 #### `move_messages`
 
-Move messages between mailboxes by IMAP UID. **Idempotent**: messages whose `Message-ID` already exists in the destination are skipped, not duplicated.
+Move messages between mailboxes by IMAP UID. **Idempotent**: messages whose `Message-ID` already exists in the destination are skipped, not duplicated. **Returns count verification** by default — captures source and destination totals before/after the move and surfaces a `countWarning` if the deltas differ from the expected count by more than 5 (tolerance for arriving mail).
 
 **Parameters:**
 
@@ -107,6 +109,7 @@ Move messages between mailboxes by IMAP UID. **Idempotent**: messages whose `Mes
 - `sourceMailbox` (string, required): Source mailbox name
 - `destinationMailbox` (string, required): Destination mailbox name
 - `dryRun` (boolean, optional): If true, return previews of messages that would be moved without performing the move.
+- `verifyCounts` (boolean, optional, default true): Capture source/dest totals before/after and surface drift in the response. Disable when chaining many moves to save 4 STATUS round-trips per call.
 
 #### `search_messages`
 
@@ -126,13 +129,14 @@ Search for messages using various criteria.
 
 #### `delete_messages`
 
-Delete messages from a mailbox by IMAP UID.
+Delete messages from a mailbox by IMAP UID. **Returns count verification** by default (same shape as `move_messages`, source-only).
 
 **Parameters:**
 
 - `messageIds` (array of UIDs as strings, required): IMAP UIDs to delete.
 - `mailbox` (string, optional): Mailbox name (default: "INBOX")
 - `dryRun` (boolean, optional): If true, return previews of messages that would be deleted without performing the delete.
+- `verifyCounts` (boolean, optional, default true): Capture mailbox total before/after and surface drift in the response.
 
 #### `set_flags`
 
@@ -157,13 +161,17 @@ Download an attachment from a specific message by IMAP UID.
 
 #### `auto_organize`
 
-Automatically organize emails based on rules (sender, subject keywords, etc.).
+Automatically organize emails based on rules (sender, subject keywords, etc.). Each rule result includes a `ruleStatus` of `"completed" | "pending" | "failed"`. When the time budget is exhausted before all rules run, remaining rules are returned with `ruleStatus: "pending"` and full `messages` arrays so callers can chain a follow-up call with just the pending rules.
 
 **Parameters:**
 
 - `rules` (array, required): Array of organization rules with conditions and actions
 - `sourceMailbox` (string, optional): Source mailbox to organize (default: "INBOX")
 - `dryRun` (boolean, optional): If true, only shows what would be organized without moving emails (default: false)
+- `maxMessages` (number, optional, default 100): Maximum number of recent messages to consider from `sourceMailbox`. For larger sets, use `search_messages` + `move_messages` with explicit UIDs.
+- `timeBudgetMs` (number, optional, default 50000): Wall-clock budget. When exhausted, remaining rules are returned with `ruleStatus: "pending"` instead of being silently dropped at the MCP-client timeout.
+
+**Returns:** `{ status, message, results, progress: { rulesTotal, rulesCompleted, rulesPending, rulesFailed, durationMs, stoppedReason? } }`.
 
 **Rule Structure:**
 

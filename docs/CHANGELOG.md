@@ -1,5 +1,42 @@
 # Changelog
 
+## v1.3.0 (2026-04-27)
+
+### Critical fix — connector wedge auto-recovery (bug #19)
+
+The 1.2.x line could wedge into a permanent `"Can not re-use ImapFlow instance"` state — every subsequent tool call failing the same way until the user manually restarted the MCP. Two paths into this state were observed: parallel tool calls fighting for the shared client, and extended serial use over hours where the IMAP socket eventually drops and the client lands in a closed-not-yet-rebuilt state.
+
+The root cause was that `ensureConnected()` would call `connect()` on a closed `ImapFlow` instance — and `imapflow` throws "Can not re-use ImapFlow instance" rather than reopening the socket. The connector then surfaced that error verbatim and stayed wedged.
+
+- **`doConnect()` now rebuilds the underlying `ImapFlow` instance** before calling `connect()` whenever the existing instance is no longer `usable`. This handles the long-session decay path and the post-close revival path uniformly.
+- **New `withRetry()` wrapper** around every IMAP-using public method. If an in-flight operation fails because the instance is wedged (matches "Can not re-use", "not connected", "connection closed", "connection ended", or "socket closed"), the wrapper force-rebuilds the client and retries the operation exactly once. Other errors propagate immediately. Callers no longer see the wedge.
+- **`check_config`** auto-heals as a side effect: it already calls `ensureConnected()`, which now rebuilds dead clients.
+
+### Move/delete count verification (bug #20)
+
+Field reports observed destination folders growing by more than the source dropped — strong-suggestion of retry double-counting or non-atomic MOVE under timeout. To make any drift visible, both `move_messages` and `delete_messages` now capture mailbox totals before and after the operation and surface the deltas in the response.
+
+- **`move_messages`** returns a `counts` object with `{ expected, sourceBefore, sourceAfter, sourceDelta, destBefore, destAfter, destDelta }`, plus a `countWarning` string when either delta differs from `expected` by more than 5 (the tolerance accounts for newly arriving mail).
+- **`delete_messages`** returns the same shape minus the destination fields.
+- New optional **`verifyCounts: boolean`** parameter (default `true`). Disable when chaining many moves to save 4 STATUS round-trips per call.
+
+### `auto_organize` — time budget + partial progress
+
+Previously, `auto_organize` would silently die at the MCP-client 60s wall and leave callers no way to know which rules ran. Now:
+
+- New optional **`timeBudgetMs`** parameter (default `50000` — leaves 10s headroom under the typical 60s wall).
+- When the budget is exhausted, remaining rules are returned with **`ruleStatus: "pending"`** instead of being dropped. Each rule result also carries `ruleStatus` (`completed` | `pending` | `failed`) and an `error` string on failure.
+- Response now includes a **`progress`** object: `{ rulesTotal, rulesCompleted, rulesPending, rulesFailed, durationMs, stoppedReason }`. Callers can chain follow-up calls with just the pending rules.
+
+### Notes
+
+- **Non-breaking minor release.** `EmailMessage` and tool input/output shapes remain backwards compatible; new fields (`counts`, `countWarning`, `progress`, `ruleStatus`) are additive.
+- Tests rewritten and expanded — now 51 (up from 43). New cases cover the dead-client retry path, count-verification reporting, and the auto-organize budget + pending mechanism.
+
+**Full Changelog**: https://github.com/minagishl/icloud-mail-mcp/compare/v1.2.0...v1.3.0
+
+---
+
 ## v1.2.0 (2026-04-26)
 
 ### Critical fixes (data integrity)

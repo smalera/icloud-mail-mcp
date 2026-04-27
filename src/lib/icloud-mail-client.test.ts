@@ -341,12 +341,18 @@ describe('iCloudMailClient', () => {
   });
 
   describe('ensureConnected — auto-reconnect after close', () => {
-    it('reconnects when client becomes unusable', async () => {
-      const m = lastClient!;
-      m.usable = false;
-      m.authenticated = false;
+    it('rebuilds the client and connects when previous instance is unusable', async () => {
+      // Bug #19 fix: doConnect() rebuilds before connect() because ImapFlow
+      // throws "Can not re-use ImapFlow instance" if you call connect() on a
+      // closed instance. The old client's connect() must NOT be called.
+      const old = lastClient!;
+      old.usable = false;
+      old.authenticated = false;
       await client.ensureConnected();
-      expect(m.connect).toHaveBeenCalledTimes(1);
+      const fresh = lastClient!;
+      expect(fresh).not.toBe(old);
+      expect(fresh.connect).toHaveBeenCalledTimes(1);
+      expect(old.connect).not.toHaveBeenCalled();
     });
 
     it('is a no-op when already connected', async () => {
@@ -427,6 +433,286 @@ describe('iCloudMailClient', () => {
       }
       expect(caught).toBeInstanceOf(IcloudMailError);
       expect((caught as IcloudMailError).kind).toBe('invalid_input');
+    });
+  });
+
+  describe('dead-client recovery (bug #19)', () => {
+    it('catches "Can not re-use ImapFlow instance" mid-operation, rebuilds, and retries once', async () => {
+      const initial = lastClient!;
+      let messageMoveCalls = 0;
+      initial.fetch.mockImplementation(() =>
+        asyncFromArray([
+          {
+            uid: 1,
+            envelope: {
+              messageId: '<a@example.com>',
+              from: [{ address: 'a@example.com' }],
+              subject: 's',
+            },
+          },
+        ])
+      );
+      initial.search.mockResolvedValue([]); // dest is empty
+      initial.messageMove.mockImplementation(async () => {
+        messageMoveCalls++;
+        if (messageMoveCalls === 1) {
+          throw new Error('Can not re-use ImapFlow instance');
+        }
+      });
+
+      const result = await client.moveMessages(['1'], 'INBOX', 'Archive', {
+        verifyCounts: false,
+      });
+
+      // After the wedge, the client should be rebuilt and the move retried.
+      expect(messageMoveCalls).toBeGreaterThanOrEqual(1);
+      // lastClient is now the rebuilt instance — different identity.
+      expect(lastClient!).not.toBe(initial);
+      expect(result.status).toBe('success');
+    });
+
+    it('does NOT retry on non-wedge errors (e.g. AUTHENTICATIONFAILED)', async () => {
+      const m = lastClient!;
+      m.fetch.mockImplementation(() =>
+        asyncFromArray([
+          {
+            uid: 1,
+            envelope: {
+              messageId: '<a@example.com>',
+              from: [{ address: 'a@example.com' }],
+              subject: 's',
+            },
+          },
+        ])
+      );
+      m.search.mockResolvedValue([]);
+      m.messageMove.mockRejectedValue(
+        new Error('AUTHENTICATIONFAILED: bad password')
+      );
+
+      let caught: unknown;
+      try {
+        await client.moveMessages(['1'], 'INBOX', 'Archive', {
+          verifyCounts: false,
+        });
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(IcloudMailError);
+      expect((caught as IcloudMailError).kind).toBe('auth');
+      // Mock was called only once — no rebuild + retry path triggered.
+      expect(m.messageMove).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('count verification (bug #20)', () => {
+    it('returns counts and no warning when source/dest deltas match expected', async () => {
+      const m = lastClient!;
+      m.fetch.mockImplementation(() =>
+        asyncFromArray([
+          {
+            uid: 1,
+            envelope: {
+              messageId: '<a@example.com>',
+              from: [{ address: 'a@example.com' }],
+              subject: 's',
+            },
+          },
+          {
+            uid: 2,
+            envelope: {
+              messageId: '<b@example.com>',
+              from: [{ address: 'b@example.com' }],
+              subject: 's',
+            },
+          },
+        ])
+      );
+      m.search.mockResolvedValue([]); // dest empty
+      // Sequence of 4 status calls: source-before, dest-before, source-after, dest-after.
+      m.status
+        .mockResolvedValueOnce({ messages: 100, unseen: 0, recent: 0 })
+        .mockResolvedValueOnce({ messages: 0, unseen: 0, recent: 0 })
+        .mockResolvedValueOnce({ messages: 98, unseen: 0, recent: 0 })
+        .mockResolvedValueOnce({ messages: 2, unseen: 0, recent: 0 });
+
+      const result = await client.moveMessages(['1', '2'], 'INBOX', 'Archive');
+      expect(result.counts).toEqual({
+        expected: 2,
+        sourceBefore: 100,
+        sourceAfter: 98,
+        sourceDelta: 2,
+        destBefore: 0,
+        destAfter: 2,
+        destDelta: 2,
+      });
+      expect(result.countWarning).toBeUndefined();
+    });
+
+    it('surfaces countWarning when destination grows by more than expected', async () => {
+      const m = lastClient!;
+      m.fetch.mockImplementation(() =>
+        asyncFromArray([
+          {
+            uid: 1,
+            envelope: {
+              messageId: '<a@example.com>',
+              from: [{ address: 'a@example.com' }],
+              subject: 's',
+            },
+          },
+        ])
+      );
+      m.search.mockResolvedValue([]);
+      // Destination grew by 50 even though we only attempted 1 move.
+      m.status
+        .mockResolvedValueOnce({ messages: 100, unseen: 0, recent: 0 })
+        .mockResolvedValueOnce({ messages: 0, unseen: 0, recent: 0 })
+        .mockResolvedValueOnce({ messages: 99, unseen: 0, recent: 0 })
+        .mockResolvedValueOnce({ messages: 50, unseen: 0, recent: 0 });
+
+      const result = await client.moveMessages(['1'], 'INBOX', 'Archive');
+      expect(result.countWarning).toBeDefined();
+      expect(result.countWarning).toMatch(/destination/i);
+      expect(result.counts?.destDelta).toBe(50);
+    });
+
+    it('skips count verification when verifyCounts: false', async () => {
+      const m = lastClient!;
+      m.fetch.mockImplementation(() =>
+        asyncFromArray([
+          {
+            uid: 1,
+            envelope: {
+              messageId: '<a@example.com>',
+              from: [{ address: 'a@example.com' }],
+              subject: 's',
+            },
+          },
+        ])
+      );
+      m.search.mockResolvedValue([]);
+
+      const result = await client.moveMessages(['1'], 'INBOX', 'Archive', {
+        verifyCounts: false,
+      });
+      expect(m.status).not.toHaveBeenCalled();
+      expect(result.counts).toBeUndefined();
+      expect(result.countWarning).toBeUndefined();
+    });
+
+    it('deleteMessages count verification produces sourceDelta', async () => {
+      const m = lastClient!;
+      m.status
+        .mockResolvedValueOnce({ messages: 50, unseen: 0, recent: 0 })
+        .mockResolvedValueOnce({ messages: 49, unseen: 0, recent: 0 });
+
+      const result = await client.deleteMessages(['7'], 'INBOX');
+      expect(result.counts).toEqual({
+        expected: 1,
+        sourceBefore: 50,
+        sourceAfter: 49,
+        sourceDelta: 1,
+      });
+      expect(result.countWarning).toBeUndefined();
+    });
+  });
+
+  describe('autoOrganize time budget + partial progress', () => {
+    it('marks rules as pending when budget is already exhausted', async () => {
+      // Use timeBudgetMs: -1 for deterministic exhaustion: any elapsed time
+      // (including 0) exceeds -1, so every rule with matches gets flagged
+      // pending. This tests the partial-progress reporting machinery without
+      // fighting real-time clocks under vitest.
+      const m = lastClient!;
+      m.search.mockResolvedValue([1, 2]);
+      m.fetch.mockImplementation(() =>
+        asyncFromArray([
+          {
+            uid: 1,
+            envelope: {
+              from: [{ address: 'foo@example.com' }],
+              subject: 'sub1',
+              messageId: '<1@example.com>',
+            },
+            flags: new Set(),
+          },
+          {
+            uid: 2,
+            envelope: {
+              from: [{ address: 'bar@example.com' }],
+              subject: 'sub2',
+              messageId: '<2@example.com>',
+            },
+            flags: new Set(),
+          },
+        ])
+      );
+
+      const result = await client.autoOrganize(
+        [
+          {
+            name: 'rule-1',
+            condition: { fromContains: 'foo@example.com' },
+            action: { moveToMailbox: 'A' },
+          },
+          {
+            name: 'rule-2',
+            condition: { fromContains: 'bar@example.com' },
+            action: { moveToMailbox: 'B' },
+          },
+        ],
+        'INBOX',
+        false,
+        100,
+        -1 // already-exhausted budget
+      );
+
+      expect(result.progress.rulesTotal).toBe(2);
+      expect(result.progress.rulesPending).toBe(2);
+      expect(result.progress.rulesCompleted).toBe(0);
+      expect(result.progress.stoppedReason).toBeDefined();
+      expect(result.progress.stoppedReason).toMatch(/budget/i);
+      // Critical: the destructive operation must NOT have run on any pending rule.
+      expect(m.messageMove).not.toHaveBeenCalled();
+      expect(result.results.every((r) => r.ruleStatus === 'pending')).toBe(
+        true
+      );
+    });
+
+    it('marks rules as completed when within budget', async () => {
+      const m = lastClient!;
+      m.search.mockResolvedValue([1]);
+      m.fetch.mockImplementation(() =>
+        asyncFromArray([
+          {
+            uid: 1,
+            envelope: {
+              from: [{ address: 'foo@example.com' }],
+              subject: 's',
+              messageId: '<1@example.com>',
+            },
+            flags: new Set(),
+          },
+        ])
+      );
+
+      const result = await client.autoOrganize(
+        [
+          {
+            name: 'rule-1',
+            condition: { fromContains: 'foo@example.com' },
+            action: { moveToMailbox: 'A' },
+          },
+        ],
+        'INBOX',
+        true, // dryRun — instant
+        100,
+        5000
+      );
+      expect(result.progress.rulesPending).toBe(0);
+      expect(result.progress.rulesCompleted).toBe(1);
+      expect(result.progress.stoppedReason).toBeUndefined();
     });
   });
 });
